@@ -144,11 +144,20 @@ def main():
                             if m.name in ("control", "./control"):
                                 raw = tar.extractfile(m).read().decode("utf-8", "ignore").strip()
                                 fields = {}
+                                clean_lines = []
                                 for line in raw.splitlines():
-                                    if ":" in line and not line.startswith(" "):
-                                        k, v = line.split(":", 1)
-                                        fields[k.strip()] = v.strip()
-                                return raw, fields
+                                    line_s = line.rstrip()
+                                    if not line_s:
+                                        continue
+                                    if line_s.startswith(" ") or line_s.startswith("\t"):
+                                        clean_lines.append(line_s)
+                                    elif ":" in line_s:
+                                        k, v = line_s.split(":", 1)
+                                        if v.strip():  # игнорируем пустые поля, ломающие Cydia
+                                            clean_lines.append(f"{k.strip()}: {v.strip()}")
+                                            fields[k.strip()] = v.strip()
+                                raw_cleaned = "\n".join(clean_lines)
+                                return raw_cleaned, fields
         return None, {}
 
     # 3. Сканирование папки debs/
@@ -161,15 +170,31 @@ def main():
         print("  -> Создаю основу репозитория (твики можно будет добавить позже).")
     else:
         for fname in debs:
+            # Очистка имени файла от пробелов и скобок (Cydia не принимает пробелы в Filename)
+            clean_fname = re.sub(r'[\s\(\)\[\]]', '_', fname)
+            clean_fname = re.sub(r'_+', '_', clean_fname).replace('_.deb', '.deb')
+            if clean_fname != fname:
+                old_p = os.path.join(DEBS_DIR, fname)
+                new_p = os.path.join(DEBS_DIR, clean_fname)
+                try:
+                    os.rename(old_p, new_p)
+                    fname = clean_fname
+                except Exception:
+                    pass
+
             path = os.path.join(DEBS_DIR, fname)
             data = open(path, "rb").read()
             raw_ctrl, meta = parse_deb(path)
             if not raw_ctrl:
                 print(f"  [-] Ошибка чтения файла: {fname}")
                 continue
+
             entries.append(
-                f"{raw_ctrl}\nFilename: debs/{fname}\nSize: {len(data)}\n"
+                f"{raw_ctrl}\n"
+                f"Filename: ./debs/{fname}\n"
+                f"Size: {len(data)}\n"
                 f"MD5sum: {hashlib.md5(data).hexdigest()}\n"
+                f"SHA1: {hashlib.sha1(data).hexdigest()}\n"
                 f"SHA256: {hashlib.sha256(data).hexdigest()}\n"
             )
             html_items.append({
@@ -190,9 +215,13 @@ def main():
     with open(os.path.join(ROOT, "Packages.gz"), "wb") as f:
         f.write(gzip.compress(pkg_data))
 
+    # Файл .nojekyll отключает обработку Jekyll на GitHub Pages
+    with open(os.path.join(ROOT, ".nojekyll"), "w", encoding="utf-8") as f:
+        f.write("")
+
     release_content = (
         f"Origin: {config['name']}\nLabel: {config['name']}\nSuite: stable\n"
-        f"Version: 1.0\nCodename: ios\nArchitectures: iphoneos-arm\n"
+        f"Version: 1.0\nCodename: ios\nArchitectures: iphoneos-arm iphoneos-arm64\n"
         f"Components: main\nDescription: {config['description']}\n"
     )
     with open(os.path.join(ROOT, "Release"), "w", encoding="utf-8") as f:
