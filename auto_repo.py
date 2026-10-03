@@ -39,11 +39,15 @@ def run_cmd(cmd):
     return subprocess.run(cmd, shell=True, cwd=ROOT)
 
 def main():
-    print("\n" + "=" * 55)
-    print("   АВТОМАТИЧЕСКИЙ СБОРЩИК CYDIA РЕПОЗИТОРИЯ")
-    print("=" * 55 + "\n")
+    print("\n" + "=" * 60)
+    print("       АВТОМАТИЧЕСКИЙ СБОРЩИК CYDIA РЕПОЗИТОРИЯ")
+    print("=" * 60)
+    print("Подсказка:")
+    print(" • Все .deb файлы твиков кладите в папку: debs/")
+    print(" • Репозиторий на GitHub создавайте ПУСТЫМ (без README)")
+    print("=" * 60 + "\n")
 
-    # 1. Загрузка или опрос настроек
+    # 1. Загрузка существующих настроек
     config = {}
     if os.path.exists(CONFIG_FILE):
         try:
@@ -52,36 +56,73 @@ def main():
         except Exception:
             config = {}
 
-    current_gh = config.get("github_url", "")
-    print("Введите ссылку на ваш репозиторий GitHub:")
-    print("Пример: https://github.com/zovutsashok/testrepo1\n")
-    github_url = prompt("Ссылка на GitHub", current_gh).strip()
-    if not github_url:
-        print("[-] Ошибка: ссылка на GitHub не указана.")
-        return
+    # Если в config.json ссылки нет, пробуем подтянуть из git remote
+    if not config.get("github_url"):
+        try:
+            res_url = subprocess.run("git config --get remote.origin.url", shell=True, cwd=ROOT, capture_output=True, text=True)
+            remote_val = res_url.stdout.strip()
+            if remote_val:
+                config["github_url"] = remote_val
+                match_init = re.search(r"github\.com[/:]([^/]+)/([^/\.]+)", remote_val)
+                if match_init:
+                    u, r = match_init.group(1), match_init.group(2)
+                    config.setdefault("name", r)
+                    config.setdefault("url", f"https://{u}.github.io/{r}/")
+        except Exception:
+            pass
 
-    # Парсим владельца и имя репозитория
-    match = re.search(r"github\.com[/:]([^/]+)/([^/\.]+)", github_url)
-    if match:
-        user, repo_name = match.group(1), match.group(2)
-        default_pages_url = f"https://{user}.github.io/{repo_name}/"
+    reconfigure = False
+    if config.get("github_url"):
+        print("[+] Найдена сохранённая конфигурация репозитория:")
+        print(f"    Репозиторий : {config.get('github_url')}")
+        print(f"    Название    : {config.get('name', 'Cydia Repo')}")
+        print(f"    Описание    : {config.get('description', 'Твики')}")
+        print(f"    Для Cydia   : {config.get('url', '')}\n")
+        print("Нажмите [Enter] для быстрой сборки и отправки")
+        choice = prompt("или введите 1, чтобы изменить настройки", "enter")
+        if choice.strip() == "1":
+            reconfigure = True
     else:
-        user, repo_name = "User", "repo"
-        default_pages_url = "https://example.github.io/repo/"
+        reconfigure = True
 
-    repo_title = prompt("Название репозитория", config.get("name", repo_name))
-    repo_desc = prompt("Описание репозитория", config.get("description", "Твики для iOS"))
-    pages_url = default_pages_url
+    if reconfigure:
+        current_gh = config.get("github_url", "")
+        print("\nВведите ссылку на ваш репозиторий GitHub:")
+        print("Пример: https://github.com/creepyfaiz/testrepo\n")
+        github_url = prompt("Ссылка на GitHub", current_gh).strip()
+        if not github_url:
+            print("[-] Ошибка: ссылка на GitHub не указана.")
+            return
 
-    config.update({
-        "name": repo_title,
-        "description": repo_desc,
-        "url": pages_url.rstrip("/") + "/",
-        "github_url": github_url
-    })
+        match = re.search(r"github\.com[/:]([^/]+)/([^/\.]+)", github_url)
+        if match:
+            user, repo_name = match.group(1), match.group(2)
+            default_pages_url = f"https://{user}.github.io/{repo_name}/"
+        else:
+            user, repo_name = "User", "repo"
+            default_pages_url = "https://example.github.io/repo/"
 
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
+        repo_title = prompt("Название репозитория", config.get("name", repo_name))
+        repo_desc = prompt("Описание репозитория", config.get("description", "Твики для iOS"))
+        pages_url = default_pages_url
+
+        config.update({
+            "name": repo_title,
+            "description": repo_desc,
+            "url": pages_url.rstrip("/") + "/",
+            "github_url": github_url
+        })
+
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+        print("\n[+] Настройки сохранены в config.json!")
+    else:
+        github_url = config.get("github_url", "")
+        match = re.search(r"github\.com[/:]([^/]+)/([^/\.]+)", github_url)
+        if match:
+            user, repo_name = match.group(1), match.group(2)
+        else:
+            user, repo_name = "User", "repo"
 
     # 2. Функция чтения метаданных из .deb
     def parse_deb(deb_path):
@@ -158,22 +199,41 @@ def main():
         f.write(release_content)
 
     cydia_add = f"cydia://url/https://cydia.saurik.com/api/share#?source={config['url']}"
+    sileo_add = f"sileo://source/{config['url']}"
     items_card = "".join([
-        f'<div style="background:#fff;border:1px solid #ddd;border-radius:10px;padding:12px;margin:10px 0">'
-        f'<b>{x["name"]}</b> <span style="float:right;color:#007aff">{x["ver"]}</span>'
-        f'<p style="color:#666;margin:6px 0">{x["desc"]}</p>'
-        f'<a style="color:#007aff;text-decoration:none;font-size:13px" href="{x["file"]}">Скачать .deb</a></div>'
+        f'<div style="background:#fff;border:1px solid #ddd;border-radius:10px;padding:14px;margin:12px 0;box-shadow:0 1px 3px rgba(0,0,0,0.05)">'
+        f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">'
+        f'<b style="font-size:16px">{x["name"]}</b> <span style="background:#007aff;color:#fff;padding:2px 8px;border-radius:12px;font-size:12px">{x["ver"]}</span></div>'
+        f'<p style="color:#555;font-size:14px;margin:6px 0 10px">{x["desc"]}</p>'
+        f'<a style="display:inline-block;background:#f0f2f5;color:#007aff;text-decoration:none;font-weight:600;font-size:13px;padding:6px 12px;border-radius:6px" href="{x["file"]}">Скачать .deb</a></div>'
         for x in html_items
-    ]) or '<p style="color:#888;text-align:center">В репозитории пока нет пакетов. Добавьте файлы в папку debs/.</p>'
+    ]) or '<p style="color:#888;text-align:center;padding:20px 0">В репозитории пока нет пакетов. Добавьте файлы в папку debs/.</p>'
 
     html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{config['name']}</title></head>
-<body style="font-family:-apple-system,sans-serif;background:#edf0f5;padding:16px;max-width:500px;margin:0 auto">
-<h2 style="margin:0 0 6px">{config['name']}</h2>
-<p style="color:#555;margin:0 0 14px">{config['description']}</p>
-<a href="{cydia_add}" style="display:block;background:#007aff;color:#fff;padding:12px;text-align:center;text-decoration:none;border-radius:10px;font-weight:bold">Добавить в Cydia</a>
-<h3>Доступные пакеты ({len(html_items)}):</h3>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:#edf0f5;padding:16px;max-width:520px;margin:0 auto;color:#222">
+<div style="text-align:center;margin:18px 0 20px">
+  <h1 style="margin:0 0 6px;font-size:24px">{config['name']}</h1>
+  <p style="color:#666;margin:0;font-size:15px">{config['description']}</p>
+</div>
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">
+  <a href="{cydia_add}" style="display:block;background:linear-gradient(180deg,#8b5a2b,#654321);color:#fff;padding:12px 6px;text-align:center;text-decoration:none;border-radius:10px;font-weight:bold;font-size:14px">Добавить в Cydia</a>
+  <a href="{sileo_add}" style="display:block;background:linear-gradient(180deg,#2997ff,#0071e3);color:#fff;padding:12px 6px;text-align:center;text-decoration:none;border-radius:10px;font-weight:bold;font-size:14px">Добавить в Sileo</a>
+</div>
+
+<div style="background:#fff;border:1px solid #ddd;border-radius:10px;padding:14px;margin-bottom:20px;font-size:13px;line-height:1.5;box-shadow:0 1px 3px rgba(0,0,0,0.05)">
+  <b>📱 Как добавить в Cydia вручную:</b>
+  <ol style="margin:6px 0 0 16px;padding:0">
+    <li>Откройте Cydia на iPhone/iPad.</li>
+    <li>Перейдите во вкладку <b>Источники</b> (Sources).</li>
+    <li>Нажмите <b>Правка</b> (Edit) ➔ <b>Добавить</b> (Add).</li>
+    <li>Введите адрес: <br><code style="background:#f4f4f4;padding:2px 6px;border-radius:4px;word-break:break-all;color:#007aff">{config['url']}</code></li>
+  </ol>
+</div>
+
+<h3 style="margin:20px 0 10px;font-size:18px">Доступные пакеты ({len(html_items)}):</h3>
 {items_card}
 </body></html>"""
     with open(os.path.join(ROOT, "index.html"), "w", encoding="utf-8") as f:
@@ -203,18 +263,38 @@ def main():
     print("\nВыполняю отправку (git push)...")
     res = run_cmd("git push -u origin main")
 
-    print("\n" + "=" * 55)
+    print("\n" + "=" * 62)
     if res.returncode == 0:
-        print("[+] ВСЕ ФАЙЛЫ УСПЕШНО ОТПРАВЛЕНЫ НА GITHUB!")
-        print("\nОСТАЛСЯ 1 ПОСЛЕДНИЙ ШАГ (ВКЛЮЧИТЬ САЙТ):")
+        print("[+] ВСЕ ФАЙЛЫ УСПЕШНО СОБРАНЫ И ОТПРАВЛЕНЫ НА GITHUB!")
+        print("=" * 62)
+        print("\n[ШАГ 1] ВКЛЮЧИТЕ GITHUB PAGES (ЕСЛИ ДЕЛАЕТЕ В ПЕРВЫЙ РАЗ):")
         if match:
-            print(f"1. Перейдите по ссылке:\n   https://github.com/{user}/{repo_name}/settings/pages")
-            print("2. В выпадающем списке Branch выберите 'main' и нажмите Save.")
-            print(f"\nВаш репозиторий в Cydia:\n-> {config['url']}")
+            print(f"  1. Откройте ссылку:\n     https://github.com/{user}/{repo_name}/settings/pages")
+            print("  2. В графе 'Branch' выберите 'main' (папка /root) и нажмите 'Save'.")
+            print("  (Через 1-2 минуты сайт и репозиторий заработают!)")
+
+        print("\n[ШАГ 2] КАК ДОБАВИТЬ РЕПОЗИТОРИЙ НА IPHONE / IPAD:")
+        print(f"  Адрес вашего репозитория:\n  -> {config['url']}")
+        print("\n  Способ А (В один клик через Safari):")
+        print(f"    Откройте {config['url']} в браузере Safari на iPhone")
+        print("    и нажмите большую кнопку 'Добавить в Cydia' (или Sileo).")
+        print("\n  Способ Б (Вручную через Cydia):")
+        print("    1. Откройте Cydia -> вкладка 'Источники' (Sources).")
+        print("    2. Нажмите 'Правка' (Edit) -> 'Добавить' (Add).")
+        print(f"    3. Введите адрес: {config['url']}")
+        print("    4. Нажмите 'Добавить источник' и дождитесь обновления.")
+
+        print("\n[КАК ДОБАВЛЯТЬ ИЛИ ОБНОВЛЯТЬ ТВКИ В БУДУЩЕМ]:")
+        print("  1. Просто положите новый .deb файл в папку 'debs'.")
+        print("  2. Запустите 'start.bat' снова.")
+        print("  Скрипт автоматически обновит каталог и отправит изменения в GitHub!")
     else:
         print("[-] Ошибка отправки на GitHub.")
-        print("    Возможно, требуется авторизация в Git (GitHub Sign-in).")
-    print("=" * 55 + "\n")
+        print("    Возможные причины:")
+        print("    1. Требуется авторизоваться в Git (GitHub Sign-in).")
+        print("    2. У аккаунта нет прав на запись в этот репозиторий.")
+        print("    3. В репозитории уже были другие файлы (он должен быть пустым).")
+    print("=" * 62 + "\n")
 
 if __name__ == "__main__":
     try:
