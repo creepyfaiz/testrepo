@@ -291,6 +291,8 @@ def main():
     
     print("\nВыполняю отправку (git push)...")
     res = run_cmd("git push -u origin main")
+    if res.returncode != 0:
+        res = run_cmd("git push -u origin main --force")
 
     print("\n" + "=" * 62)
     if res.returncode == 0:
