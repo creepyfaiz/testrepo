@@ -1,0 +1,228 @@
+# -*- coding: utf-8 -*-
+"""
+Максимально надежный автоматический сборщик Cydia-репозитория.
+Работает на Windows/macOS/Linux без внешних зависимостей.
+"""
+import os
+import sys
+import re
+import io
+import json
+import tarfile
+import hashlib
+import bz2
+import gzip
+import subprocess
+
+# Настройка безопасной кодировки вывода для Windows CMD
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+ROOT = os.path.dirname(os.path.abspath(__file__)) or "."
+CONFIG_FILE = os.path.join(ROOT, "config.json")
+DEBS_DIR = os.path.join(ROOT, "debs")
+os.makedirs(DEBS_DIR, exist_ok=True)
+
+def prompt(text, default=""):
+    try:
+        val = input(f"{text} [{default}]: " if default else f"{text}: ").strip()
+        return val if val else default
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+
+def run_cmd(cmd):
+    return subprocess.run(cmd, shell=True, cwd=ROOT)
+
+def main():
+    print("\n" + "=" * 55)
+    print("   АВТОМАТИЧЕСКИЙ СБОРЩИК CYDIA РЕПОЗИТОРИЯ")
+    print("=" * 55 + "\n")
+
+    # 1. Загрузка или опрос настроек
+    config = {}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        except Exception:
+            config = {}
+
+    current_gh = config.get("github_url", "")
+    print("Введите ссылку на ваш репозиторий GitHub:")
+    print("Пример: https://github.com/zovutsashok/testrepo1\n")
+    github_url = prompt("Ссылка на GitHub", current_gh).strip()
+    if not github_url:
+        print("[-] Ошибка: ссылка на GitHub не указана.")
+        return
+
+    # Парсим владельца и имя репозитория
+    match = re.search(r"github\.com[/:]([^/]+)/([^/\.]+)", github_url)
+    if match:
+        user, repo_name = match.group(1), match.group(2)
+        default_pages_url = f"https://{user}.github.io/{repo_name}/"
+    else:
+        user, repo_name = "User", "repo"
+        default_pages_url = "https://example.github.io/repo/"
+
+    repo_title = prompt("Название репозитория", config.get("name", repo_name))
+    repo_desc = prompt("Описание репозитория", config.get("description", "Твики для iOS"))
+    pages_url = default_pages_url
+
+    config.update({
+        "name": repo_title,
+        "description": repo_desc,
+        "url": pages_url.rstrip("/") + "/",
+        "github_url": github_url
+    })
+
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+    # 2. Функция чтения метаданных из .deb
+    def parse_deb(deb_path):
+        with open(deb_path, "rb") as f:
+            if f.read(8) != b"!<arch>\n":
+                return None, {}
+            while True:
+                h = f.read(60)
+                if len(h) < 60:
+                    break
+                name = h[:16].strip().decode("ascii", "ignore")
+                size = int(h[48:58].strip())
+                data = f.read(size)
+                if size % 2:
+                    f.read(1)
+                if name.startswith("control.tar"):
+                    with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tar:
+                        for m in tar.getmembers():
+                            if m.name in ("control", "./control"):
+                                raw = tar.extractfile(m).read().decode("utf-8", "ignore").strip()
+                                fields = {}
+                                for line in raw.splitlines():
+                                    if ":" in line and not line.startswith(" "):
+                                        k, v = line.split(":", 1)
+                                        fields[k.strip()] = v.strip()
+                                return raw, fields
+        return None, {}
+
+    # 3. Сканирование папки debs/
+    print("\n[1/3] Поиск твиков в папке debs/...")
+    entries, html_items = [], []
+    debs = [f for f in sorted(os.listdir(DEBS_DIR)) if f.endswith(".deb")]
+
+    if not debs:
+        print("  -> В папке debs/ пока нет файлов .deb.")
+        print("  -> Создаю основу репозитория (твики можно будет добавить позже).")
+    else:
+        for fname in debs:
+            path = os.path.join(DEBS_DIR, fname)
+            data = open(path, "rb").read()
+            raw_ctrl, meta = parse_deb(path)
+            if not raw_ctrl:
+                print(f"  [-] Ошибка чтения файла: {fname}")
+                continue
+            entries.append(
+                f"{raw_ctrl}\nFilename: debs/{fname}\nSize: {len(data)}\n"
+                f"MD5sum: {hashlib.md5(data).hexdigest()}\n"
+                f"SHA256: {hashlib.sha256(data).hexdigest()}\n"
+            )
+            html_items.append({
+                "name": meta.get("Name", meta.get("Package", fname)),
+                "ver": meta.get("Version", "1.0"),
+                "desc": meta.get("Description", "Нет описания"),
+                "file": f"debs/{fname}"
+            })
+            print(f"  [+] Добавлен твик: {meta.get('Name', fname)} (версия {meta.get('Version', '1.0')})")
+
+    # 4. Создание файлов для Cydia
+    print("\n[2/3] Генерация индексов для Cydia...")
+    pkg_data = ("\n\n".join(entries) + ("\n" if entries else "")).encode("utf-8")
+    with open(os.path.join(ROOT, "Packages"), "wb") as f:
+        f.write(pkg_data)
+    with open(os.path.join(ROOT, "Packages.bz2"), "wb") as f:
+        f.write(bz2.compress(pkg_data))
+    with open(os.path.join(ROOT, "Packages.gz"), "wb") as f:
+        f.write(gzip.compress(pkg_data))
+
+    release_content = (
+        f"Origin: {config['name']}\nLabel: {config['name']}\nSuite: stable\n"
+        f"Version: 1.0\nCodename: ios\nArchitectures: iphoneos-arm\n"
+        f"Components: main\nDescription: {config['description']}\n"
+    )
+    with open(os.path.join(ROOT, "Release"), "w", encoding="utf-8") as f:
+        f.write(release_content)
+
+    cydia_add = f"cydia://url/https://cydia.saurik.com/api/share#?source={config['url']}"
+    items_card = "".join([
+        f'<div style="background:#fff;border:1px solid #ddd;border-radius:10px;padding:12px;margin:10px 0">'
+        f'<b>{x["name"]}</b> <span style="float:right;color:#007aff">{x["ver"]}</span>'
+        f'<p style="color:#666;margin:6px 0">{x["desc"]}</p>'
+        f'<a style="color:#007aff;text-decoration:none;font-size:13px" href="{x["file"]}">Скачать .deb</a></div>'
+        for x in html_items
+    ]) or '<p style="color:#888;text-align:center">В репозитории пока нет пакетов. Добавьте файлы в папку debs/.</p>'
+
+    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{config['name']}</title></head>
+<body style="font-family:-apple-system,sans-serif;background:#edf0f5;padding:16px;max-width:500px;margin:0 auto">
+<h2 style="margin:0 0 6px">{config['name']}</h2>
+<p style="color:#555;margin:0 0 14px">{config['description']}</p>
+<a href="{cydia_add}" style="display:block;background:#007aff;color:#fff;padding:12px;text-align:center;text-decoration:none;border-radius:10px;font-weight:bold">Добавить в Cydia</a>
+<h3>Доступные пакеты ({len(html_items)}):</h3>
+{items_card}
+</body></html>"""
+    with open(os.path.join(ROOT, "index.html"), "w", encoding="utf-8") as f:
+        f.write(html)
+
+    print("  [+] Файлы Packages, Packages.bz2, Release и index.html готовы.")
+
+    # 5. Автоматическая отправка в GitHub
+    print("\n[3/3] Подготовка и отправка в GitHub...")
+    remote_url = github_url.rstrip("/") + ".git" if not github_url.endswith(".git") else github_url
+
+    if not os.path.exists(os.path.join(ROOT, ".git")):
+        run_cmd("git init")
+        run_cmd("git branch -M main")
+        run_cmd(f"git remote add origin {remote_url}")
+    else:
+        # Обновляем remote URL, если репозиторий уже был инициализирован
+        run_cmd(f"git remote set-url origin {remote_url}")
+
+    # Защита от ошибки "Author identity unknown"
+    run_cmd('git config user.name "Cydia Builder"')
+    run_cmd('git config user.email "cydia@local"')
+
+    run_cmd("git add .")
+    run_cmd('git commit -m "Update Cydia repository"')
+    
+    print("\nВыполняю отправку (git push)...")
+    res = run_cmd("git push -u origin main")
+
+    print("\n" + "=" * 55)
+    if res.returncode == 0:
+        print("[+] ВСЕ ФАЙЛЫ УСПЕШНО ОТПРАВЛЕНЫ НА GITHUB!")
+        print("\nОСТАЛСЯ 1 ПОСЛЕДНИЙ ШАГ (ВКЛЮЧИТЬ САЙТ):")
+        if match:
+            print(f"1. Перейдите по ссылке:\n   https://github.com/{user}/{repo_name}/settings/pages")
+            print("2. В выпадающем списке Branch выберите 'main' и нажмите Save.")
+            print(f"\nВаш репозиторий в Cydia:\n-> {config['url']}")
+    else:
+        print("[-] Ошибка отправки на GitHub.")
+        print("    Возможно, требуется авторизация в Git (GitHub Sign-in).")
+    print("=" * 55 + "\n")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as err:
+        print(f"\n[-] Произошла непредвиденная ошибка: {err}")
+    finally:
+        try:
+            input("Нажмите Enter для завершения...")
+        except Exception:
+            pass
